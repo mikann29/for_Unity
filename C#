@@ -1,0 +1,432 @@
+#if UNITY_EDITOR
+using System.Collections.Generic;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+public class PixelArtWindow : EditorWindow
+{
+    enum ToolMode { Pen, Eraser, Picker }
+    enum DotAspectPreset
+    {
+        _1_1,
+        _5_4,
+        _4_5,
+        _2_1,
+        _1_2,
+        Custom
+    }
+
+    [SerializeField] int width = 32;
+    [SerializeField] int height = 32;
+
+    // “基準ズーム” × “ドット比” で、画面上の1ドットの矩形サイズを決める
+    [SerializeField] int zoom = 16; // 1基準単位（4〜40推奨）
+    [SerializeField] DotAspectPreset aspectPreset = DotAspectPreset._1_1;
+    [SerializeField] int dotAspectX = 1; // 例：5
+    [SerializeField] int dotAspectY = 1; // 例：4
+
+    [SerializeField] bool showGrid = true;
+    [SerializeField] bool exportScaled = true; // 保存時に dotAspect を実寸に反映するか
+
+    [SerializeField] ToolMode tool = ToolMode.Pen;
+    [SerializeField] Color currentColor = Color.black;
+
+    Texture2D tex;
+    Color32[] pixels;
+
+    readonly Stack<Color32[]> undo = new Stack<Color32[]>();
+    readonly Stack<Color32[]> redo = new Stack<Color32[]>();
+
+    bool isDrawing;
+    bool dirty;
+
+    int CellW => Mathf.Max(1, zoom) * Mathf.Max(1, dotAspectX);
+    int CellH => Mathf.Max(1, zoom) * Mathf.Max(1, dotAspectY);
+
+    [MenuItem("Tools/Pixel Art Window")]
+    public static void Open() => GetWindow<PixelArtWindow>("Pixel Art");
+
+    void OnEnable()
+    {
+        ApplyAspectPresetIfNeeded(force: true);
+        CreateCanvas(width, height);
+    }
+
+    void OnDisable()
+    {
+        if (tex != null) DestroyImmediate(tex);
+    }
+
+    void CreateCanvas(int w, int h)
+    {
+        width = Mathf.Clamp(w, 1, 512);
+        height = Mathf.Clamp(h, 1, 512);
+
+        if (tex != null) DestroyImmediate(tex);
+
+        tex = new Texture2D(width, height, TextureFormat.RGBA32, mipChain: false, linear: true);
+        tex.filterMode = FilterMode.Point;
+        tex.wrapMode = TextureWrapMode.Clamp;
+        tex.hideFlags = HideFlags.HideAndDontSave;
+
+        pixels = new Color32[width * height];
+        for (int i = 0; i < pixels.Length; i++) pixels[i] = new Color32(0, 0, 0, 0);
+
+        ApplyPixels();
+
+        undo.Clear();
+        redo.Clear();
+        dirty = false;
+        Repaint();
+    }
+
+    void ApplyPixels()
+    {
+        tex.SetPixels32(pixels);
+        tex.Apply(updateMipmaps: false, makeNoLongerReadable: false);
+    }
+
+    void PushUndo()
+    {
+        undo.Push((Color32[])pixels.Clone());
+        redo.Clear();
+    }
+
+    void DoUndo()
+    {
+        if (undo.Count == 0) return;
+        redo.Push((Color32[])pixels.Clone());
+        pixels = undo.Pop();
+        ApplyPixels();
+        Repaint();
+    }
+
+    void DoRedo()
+    {
+        if (redo.Count == 0) return;
+        undo.Push((Color32[])pixels.Clone());
+        pixels = redo.Pop();
+        ApplyPixels();
+        Repaint();
+    }
+
+    void OnGUI()
+    {
+        HandleShortcuts();
+
+        using (new EditorGUILayout.VerticalScope())
+        {
+            DrawToolbar();
+            EditorGUILayout.Space(6);
+            DrawCanvasArea();
+        }
+
+        if (dirty)
+        {
+            ApplyPixels();
+            dirty = false;
+        }
+    }
+
+    void HandleShortcuts()
+    {
+        var e = Event.current;
+        if (e.type != EventType.KeyDown) return;
+
+        bool ctrl = e.control || e.command;
+        if (ctrl && e.keyCode == KeyCode.Z)
+        {
+            DoUndo();
+            e.Use();
+        }
+        else if (ctrl && (e.keyCode == KeyCode.Y || (e.shift && e.keyCode == KeyCode.Z)))
+        {
+            DoRedo();
+            e.Use();
+        }
+    }
+
+    void DrawToolbar()
+    {
+        using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+        {
+            tool = (ToolMode)GUILayout.Toolbar(
+                (int)tool,
+                new[] { "Pen", "Eraser", "Picker" },
+                EditorStyles.toolbarButton,
+                GUILayout.Width(220));
+
+            GUILayout.Space(8);
+            currentColor = EditorGUILayout.ColorField(currentColor, GUILayout.Width(140));
+
+            GUILayout.Space(8);
+            showGrid = GUILayout.Toggle(showGrid, "Grid", EditorStyles.toolbarButton, GUILayout.Width(60));
+
+            GUILayout.FlexibleSpace();
+
+            zoom = EditorGUILayout.IntSlider("Zoom", zoom, 4, 40, GUILayout.Width(240));
+
+            if (GUILayout.Button("New", EditorStyles.toolbarButton, GUILayout.Width(50)))
+            {
+                CreateCanvas(width, height);
+            }
+
+            if (GUILayout.Button("Save PNG", EditorStyles.toolbarButton, GUILayout.Width(80)))
+            {
+                SavePng();
+            }
+        }
+
+        // 設定行
+        using (new EditorGUILayout.HorizontalScope())
+        {
+            width = EditorGUILayout.IntField("W", width, GUILayout.Width(120));
+            height = EditorGUILayout.IntField("H", height, GUILayout.Width(120));
+            if (GUILayout.Button("Resize", GUILayout.Width(80)))
+            {
+                CreateCanvas(width, height);
+            }
+
+            GUILayout.Space(12);
+
+            // ドット比（1:1 / 5:4 など）
+            var newPreset = (DotAspectPreset)EditorGUILayout.EnumPopup("Dot", aspectPreset, GUILayout.Width(200));
+            if (newPreset != aspectPreset)
+            {
+                aspectPreset = newPreset;
+                ApplyAspectPresetIfNeeded(force: true);
+            }
+
+            if (aspectPreset == DotAspectPreset.Custom)
+            {
+                dotAspectX = EditorGUILayout.IntField("X", dotAspectX, GUILayout.Width(90));
+                dotAspectY = EditorGUILayout.IntField("Y", dotAspectY, GUILayout.Width(90));
+                dotAspectX = Mathf.Clamp(dotAspectX, 1, 32);
+                dotAspectY = Mathf.Clamp(dotAspectY, 1, 32);
+            }
+
+            GUILayout.Space(8);
+            exportScaled = GUILayout.Toggle(exportScaled, "Export scaled", GUILayout.Width(120));
+
+            GUILayout.FlexibleSpace();
+            GUILayout.Label($"Cell: {CellW}×{CellH}px", EditorStyles.miniLabel);
+        }
+    }
+
+    void ApplyAspectPresetIfNeeded(bool force)
+    {
+        if (!force) return;
+
+        switch (aspectPreset)
+        {
+            case DotAspectPreset._1_1:
+                dotAspectX = 1; dotAspectY = 1; break;
+            case DotAspectPreset._5_4:
+                dotAspectX = 5; dotAspectY = 4; break;
+            case DotAspectPreset._4_5:
+                dotAspectX = 4; dotAspectY = 5; break;
+            case DotAspectPreset._2_1:
+                dotAspectX = 2; dotAspectY = 1; break;
+            case DotAspectPreset._1_2:
+                dotAspectX = 1; dotAspectY = 2; break;
+            case DotAspectPreset.Custom:
+                dotAspectX = Mathf.Clamp(dotAspectX, 1, 32);
+                dotAspectY = Mathf.Clamp(dotAspectY, 1, 32);
+                break;
+        }
+    }
+
+    void DrawCanvasArea()
+    {
+        float canvasW = width * CellW;
+        float canvasH = height * CellH;
+
+        Rect rect = GUILayoutUtility.GetRect(canvasW, canvasH, GUILayout.ExpandWidth(false), GUILayout.ExpandHeight(false));
+        GUI.Box(rect, GUIContent.none);
+
+        // 表示は StretchToFill にすることで “非正方ドット” を表現
+        GUI.DrawTexture(rect, tex, ScaleMode.StretchToFill, alphaBlend: true);
+
+        // グリッド
+        if (showGrid && (CellW >= 6 || CellH >= 6))
+        {
+            DrawGrid(rect);
+        }
+
+        HandleCanvasInput(rect);
+    }
+
+    void DrawGrid(Rect rect)
+    {
+        Handles.BeginGUI();
+        Color c = new Color(0f, 0f, 0f, 0.2f);
+
+        for (int x = 0; x <= width; x++)
+        {
+            float px = rect.x + x * CellW;
+            Handles.color = c;
+            Handles.DrawLine(new Vector3(px, rect.y), new Vector3(px, rect.y + rect.height));
+        }
+
+        for (int y = 0; y <= height; y++)
+        {
+            float py = rect.y + y * CellH;
+            Handles.color = c;
+            Handles.DrawLine(new Vector3(rect.x, py), new Vector3(rect.x + rect.width, py));
+        }
+
+        Handles.EndGUI();
+    }
+
+    void HandleCanvasInput(Rect rect)
+    {
+        var e = Event.current;
+        Vector2 mouse = e.mousePosition;
+
+        if (!rect.Contains(mouse)) return;
+
+        int px = Mathf.FloorToInt((mouse.x - rect.x) / CellW);
+        int pyGui = Mathf.FloorToInt((mouse.y - rect.y) / CellH);
+        int py = (height - 1) - pyGui;
+
+        if (!InBounds(px, py)) return;
+
+        if (e.type == EventType.MouseDown && e.button == 0)
+        {
+            PushUndo();
+            isDrawing = true;
+            ApplyTool(px, py);
+            e.Use();
+        }
+        else if (e.type == EventType.MouseDrag && e.button == 0 && isDrawing)
+        {
+            ApplyTool(px, py);
+            e.Use();
+        }
+        else if (e.type == EventType.MouseUp && e.button == 0 && isDrawing)
+        {
+            isDrawing = false;
+            e.Use();
+        }
+    }
+
+    void ApplyTool(int x, int y)
+    {
+        int idx = x + y * width;
+
+        switch (tool)
+        {
+            case ToolMode.Pen:
+                SetPixel(idx, (Color32)currentColor);
+                break;
+
+            case ToolMode.Eraser:
+                SetPixel(idx, new Color32(0, 0, 0, 0));
+                break;
+
+            case ToolMode.Picker:
+                currentColor = pixels[idx];
+                Repaint();
+                break;
+        }
+    }
+
+    void SetPixel(int idx, Color32 col)
+    {
+        if (pixels[idx].Equals(col)) return;
+        pixels[idx] = col;
+        dirty = true;
+        Repaint();
+    }
+
+    bool InBounds(int x, int y) => x >= 0 && x < width && y >= 0 && y < height;
+
+    Texture2D BuildScaledExportTexture(int scaleX, int scaleY)
+    {
+        scaleX = Mathf.Clamp(scaleX, 1, 64);
+        scaleY = Mathf.Clamp(scaleY, 1, 64);
+
+        int newW = width * scaleX;
+        int newH = height * scaleY;
+
+        var dst = new Color32[newW * newH];
+
+        // pixels[] は「y=0が下段」の並び（x + y*width）
+        // それをそのままブロック複製する
+        for (int y = 0; y < height; y++)
+        {
+            int srcRow = y * width;
+            int dstRowBase = (y * scaleY) * newW;
+
+            for (int x = 0; x < width; x++)
+            {
+                Color32 c = pixels[srcRow + x];
+
+                int dstXBase = x * scaleX;
+                for (int oy = 0; oy < scaleY; oy++)
+                {
+                    int dstRow = dstRowBase + oy * newW;
+                    int dstIdx = dstRow + dstXBase;
+                    for (int ox = 0; ox < scaleX; ox++)
+                    {
+                        dst[dstIdx + ox] = c;
+                    }
+                }
+            }
+        }
+
+        var t = new Texture2D(newW, newH, TextureFormat.RGBA32, mipChain: false, linear: true);
+        t.filterMode = FilterMode.Point;
+        t.wrapMode = TextureWrapMode.Clamp;
+        t.SetPixels32(dst);
+        t.Apply(false, false);
+        return t;
+    }
+
+    void SavePng()
+    {
+        string path = EditorUtility.SaveFilePanel(
+            "Save Pixel Art PNG",
+            "Assets",
+            "pixel_art.png",
+            "png");
+
+        if (string.IsNullOrEmpty(path)) return;
+
+        Texture2D exportTex = tex;
+        Texture2D tempScaled = null;
+
+        // 5:4などを「実際のPNGサイズ」に反映したい場合
+        if (exportScaled && (dotAspectX != 1 || dotAspectY != 1))
+        {
+            tempScaled = BuildScaledExportTexture(dotAspectX, dotAspectY);
+            exportTex = tempScaled;
+        }
+
+        byte[] png = exportTex.EncodeToPNG();
+        File.WriteAllBytes(path, png);
+
+        if (tempScaled != null) DestroyImmediate(tempScaled);
+
+        // Assets配下なら自動インポート＋Sprite設定
+        if (path.Replace("\\", "/").StartsWith(Application.dataPath.Replace("\\", "/")))
+        {
+            string assetPath = "Assets" + path.Substring(Application.dataPath.Length);
+            AssetDatabase.ImportAsset(assetPath);
+
+            var importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            if (importer != null)
+            {
+                importer.textureType = TextureImporterType.Sprite;
+                importer.filterMode = FilterMode.Point;
+                importer.mipmapEnabled = false;
+                importer.alphaIsTransparency = true;
+                importer.SaveAndReimport();
+            }
+        }
+
+        Debug.Log($"Saved: {path}");
+    }
+}
+#endif
