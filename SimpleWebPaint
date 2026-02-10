@@ -1,0 +1,295 @@
+using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.EventSystems; // ★追加: UIの上かどうか判定するために必要
+using TMPro;
+
+public class SimpleWebPaint : MonoBehaviour
+{
+    enum ToolType { Pen, Eraser }
+
+    [Header("描画・パレット")]
+    [SerializeField] RawImage drawingBoard;
+    [SerializeField] RawImage colorPalette;
+    [SerializeField] AspectRatioFitter boardFitter;
+
+    [Header("パネル・ポップアップ")]
+    [SerializeField] GameObject colorPanel;   
+    [SerializeField] GameObject aspectPanel;  
+
+    [Header("入力欄 (TextMeshPro)")]
+    [SerializeField] TMP_InputField inputAspectX;
+    [SerializeField] TMP_InputField inputAspectY;
+
+    [Header("設定")]
+    [SerializeField] int width = 32;
+    [SerializeField] int height = 32;
+    [SerializeField] Color initialColor = Color.black;
+
+    [Header("初期背景")]
+    [SerializeField] bool initializeWhite = true; 
+
+    [Header("消しゴム")]
+    [SerializeField] bool eraserToTransparent = true; 
+
+    // 内部データ
+    Texture2D drawTexture;
+    Texture2D paletteTexture;
+    Color32[] pixels;
+
+    Color32 selectedColor;
+    Color32 savedColor; 
+    ToolType currentTool = ToolType.Pen;
+
+    int dotRatioX = 1;
+    int dotRatioY = 1;
+
+    bool dirty; 
+
+    void Start()
+    {
+        if (drawingBoard == null || colorPalette == null)
+        {
+            Debug.LogError("UIが未設定です");
+            enabled = false;
+            return;
+        }
+
+        if (boardFitter == null) boardFitter = drawingBoard.GetComponent<AspectRatioFitter>();
+
+        if (colorPanel != null) colorPanel.SetActive(false);
+        if (aspectPanel != null) aspectPanel.SetActive(false);
+
+        InitializeDrawingBoard();
+        InitializeColorPalette();
+
+        savedColor = (Color32)initialColor;
+        SetColor(savedColor);
+        ApplyAspectRatio();
+    }
+
+    void Update()
+    {
+        // クリック（タップ開始）で1回だけ処理する
+        if (TryGetPointerDown(out Vector2 screenPos))
+        {
+            // ★追加: もしボタンなどの「UI」の上をクリックしていたら、ドットは打たない
+            // (スマホやWebでボタンを押した瞬間に、裏のキャンバスに色が塗られるのを防ぎます)
+            if (EventSystem.current.IsPointerOverGameObject() || (Input.touchCount > 0 && EventSystem.current.IsPointerOverGameObject(Input.GetTouch(0).fingerId)))
+            {
+                // ただし、自前の「カラーパレット(RawImage)」はUI扱いなので、ここだけは除外して通す必要がある
+                // （簡易的に「カラーパネルが開いているときはパレット判定を優先」することで対応します）
+                if (colorPanel == null || !colorPanel.activeSelf) 
+                {
+                    return; 
+                }
+            }
+
+            HandleClick(screenPos);
+        }
+    }
+
+    void LateUpdate()
+    {
+        if (!dirty) return;
+        drawTexture.SetPixels32(pixels);
+        drawTexture.Apply(false);
+        dirty = false;
+    }
+
+    void OnDestroy()
+    {
+        if (drawTexture != null) Destroy(drawTexture);
+        if (paletteTexture != null) Destroy(paletteTexture);
+    }
+
+    // ---------------------------------------------------------
+    // ボタン機能
+    // ---------------------------------------------------------
+    public void OnClickPen()
+    {
+        currentTool = ToolType.Pen;
+        SetColor(savedColor);
+    }
+
+    public void OnClickEraser()
+    {
+        currentTool = ToolType.Eraser;
+    }
+
+    public void OnClickColorButton()
+    {
+        if (colorPanel == null) return;
+        bool isActive = !colorPanel.activeSelf;
+        colorPanel.SetActive(isActive);
+        if (isActive && aspectPanel != null) aspectPanel.SetActive(false);
+    }
+
+    public void OnClickAspectButton()
+    {
+        if (aspectPanel == null) return;
+        bool isActive = !aspectPanel.activeSelf;
+        aspectPanel.SetActive(isActive);
+
+        if (isActive)
+        {
+            if (inputAspectX != null) inputAspectX.text = dotRatioX.ToString();
+            if (inputAspectY != null) inputAspectY.text = dotRatioY.ToString();
+            if (colorPanel != null) colorPanel.SetActive(false);
+        }
+    }
+
+    public void OnClickApplyAspect()
+    {
+        if (inputAspectX != null && int.TryParse(inputAspectX.text, out int x)) dotRatioX = x;
+        if (inputAspectY != null && int.TryParse(inputAspectY.text, out int y)) dotRatioY = y;
+
+        dotRatioX = Mathf.Clamp(dotRatioX, 1, 64);
+        dotRatioY = Mathf.Clamp(dotRatioY, 1, 64);
+
+        ApplyAspectRatio();
+        if (aspectPanel != null) aspectPanel.SetActive(false);
+    }
+
+    // ---------------------------------------------------------
+    // クリック処理
+    // ---------------------------------------------------------
+    void HandleClick(Vector2 screenPos)
+    {
+        // カラーパレット処理を優先
+        if (colorPanel != null && colorPanel.activeInHierarchy)
+        {
+            // パレット上をクリックしたか？
+            if (RectTransformUtility.RectangleContainsScreenPoint(colorPalette.rectTransform, screenPos, GetCanvasCamera(colorPalette)))
+            {
+                PickColorFromPalette(screenPos);
+                return;
+            }
+        }
+
+        // 描画ボード上なら1ドット描画
+        if (RectTransformUtility.RectangleContainsScreenPoint(drawingBoard.rectTransform, screenPos, GetCanvasCamera(drawingBoard)))
+        {
+            DrawOneDot(screenPos);
+        }
+    }
+
+    void DrawOneDot(Vector2 screenPos)
+    {
+        if (!TryGetNormalizedPos(drawingBoard, screenPos, out Vector2 n)) return;
+
+        int px = Mathf.Clamp(Mathf.FloorToInt(n.x * width), 0, width - 1);
+        int py = Mathf.Clamp(Mathf.FloorToInt(n.y * height), 0, height - 1);
+
+        int idx = px + py * width;
+
+        Color32 paint = (currentTool == ToolType.Eraser) 
+            ? (eraserToTransparent ? new Color32(0, 0, 0, 0) : new Color32(255, 255, 255, 255))
+            : selectedColor;
+
+        if (pixels[idx].Equals(paint)) return;
+
+        pixels[idx] = paint;
+        dirty = true;
+    }
+
+    void PickColorFromPalette(Vector2 screenPos)
+    {
+        if (!TryGetNormalizedPos(colorPalette, screenPos, out Vector2 n)) return;
+
+        int px = Mathf.Clamp(Mathf.FloorToInt(n.x * paletteTexture.width), 0, paletteTexture.width - 1);
+        int py = Mathf.Clamp(Mathf.FloorToInt(n.y * paletteTexture.height), 0, paletteTexture.height - 1);
+
+        Color32 picked = (Color32)paletteTexture.GetPixel(px, py);
+
+        currentTool = ToolType.Pen;
+        savedColor = picked;
+        SetColor(picked);
+    }
+
+    void SetColor(Color32 c)
+    {
+        selectedColor = c;
+    }
+
+    void ApplyAspectRatio()
+    {
+        if (boardFitter == null) return;
+        float totalRatio = (width * (float)dotRatioX) / (height * (float)dotRatioY);
+        boardFitter.aspectRatio = totalRatio;
+    }
+
+    // ---------------------------------------------------------
+    // 初期化
+    // ---------------------------------------------------------
+    void InitializeDrawingBoard()
+    {
+        drawTexture = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        drawTexture.filterMode = FilterMode.Point;
+        drawTexture.wrapMode = TextureWrapMode.Clamp;
+        pixels = new Color32[width * height];
+
+        Color32 bg = initializeWhite ? new Color32(255, 255, 255, 255) : new Color32(0, 0, 0, 0);
+        for (int i = 0; i < pixels.Length; i++) pixels[i] = bg;
+
+        drawTexture.SetPixels32(pixels);
+        drawTexture.Apply(false);
+        drawingBoard.texture = drawTexture;
+    }
+
+    void InitializeColorPalette()
+    {
+        int pW = 128, pH = 128;
+        paletteTexture = new Texture2D(pW, pH, TextureFormat.RGB24, false);
+        paletteTexture.wrapMode = TextureWrapMode.Clamp;
+        paletteTexture.filterMode = FilterMode.Bilinear;
+
+        for (int y = 0; y < pH; y++)
+        {
+            for (int x = 0; x < pW; x++)
+            {
+                float hue = (float)x / (pW - 1);
+                float sat = 1.0f - ((float)y / (pH - 1));
+                paletteTexture.SetPixel(x, y, Color.HSVToRGB(hue, sat, 1.0f));
+            }
+        }
+        paletteTexture.Apply(false);
+        colorPalette.texture = paletteTexture;
+    }
+
+    // ---------------------------------------------------------
+    // 入力ヘルパー
+    // ---------------------------------------------------------
+    bool TryGetPointerDown(out Vector2 screenPos)
+    {
+        if (Input.touchCount > 0)
+        {
+            Touch t = Input.GetTouch(0);
+            screenPos = t.position;
+            return t.phase == TouchPhase.Began;
+        }
+
+        screenPos = Input.mousePosition;
+        return Input.GetMouseButtonDown(0);
+    }
+
+    bool TryGetNormalizedPos(RawImage target, Vector2 screenPos, out Vector2 normalizedPos)
+    {
+        normalizedPos = Vector2.zero;
+        Camera cam = GetCanvasCamera(target);
+        if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(target.rectTransform, screenPos, cam, out Vector2 localPoint))
+            return false;
+
+        Rect rect = target.rectTransform.rect;
+        normalizedPos.x = (localPoint.x - rect.xMin) / rect.width;
+        normalizedPos.y = (localPoint.y - rect.yMin) / rect.height;
+        return true;
+    }
+
+    Camera GetCanvasCamera(RawImage img)
+    {
+        var canvas = img.canvas;
+        if (canvas == null) return null;
+        if (canvas.renderMode == RenderMode.ScreenSpaceOverlay) return null;
+        return canvas.worldCamera != null ? canvas.worldCamera : Camera.main;
+    }
+}
